@@ -1,0 +1,1 @@
+blk\.(31|30|19|18|7|32|20)\.ffn_(gate|up|down)_exps\.weight=CUDA0,blk\..*\.ffn_.*_exps\.weight=CPU
