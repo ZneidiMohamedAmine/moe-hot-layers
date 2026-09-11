@@ -13,13 +13,10 @@ Tested on the kind of hardware that has no business running a 30B model at all: 
 ```
 Stock llama.cpp -ngl / auto-fit:
   [ GPU: layers 0,1,2,3,4,5... first-N-that-fit ] [ CPU/disk: everything else ]
-                     ↑
-        no idea which of these are actually load-bearing
 
 This repo:
   [ GPU: the 3-8 layers whose experts get reused constantly ] [ CPU/disk: cold layers ]
-                     ↑
-        measured, not guessed
+
 ```
 
 MoE routing is data-dependent (which expert gets picked depends on the token, not a fixed schedule) but it's *not* random. Run a real trace and you'll find some layers have highly repetitive expert selection (the same handful of experts keep getting picked turn after turn) while others are basically uniform noise across the full expert pool. The repetitive ones are the ones worth pinning to GPU. The noisy ones will thrash the GPU cache no matter where you put them, so don't waste VRAM on them.
