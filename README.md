@@ -21,7 +21,7 @@ This repo:
 
 MoE routing is data-dependent (which expert gets picked depends on the token, not a fixed schedule) but it's *not* random. Run a real trace and you'll find some layers have highly repetitive expert selection (the same handful of experts keep getting picked turn after turn) while others are basically uniform noise across the full expert pool. The repetitive ones are the ones worth pinning to GPU. The noisy ones will thrash the GPU cache no matter where you put them, so don't waste VRAM on them.
 
-## How it works, precisely
+## How it works
 
 Two things this repo actually needs to get right, spelled out instead of hand-waved:
 
