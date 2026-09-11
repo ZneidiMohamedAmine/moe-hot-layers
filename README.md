@@ -21,6 +21,14 @@ This repo:
 
 MoE routing is data-dependent (which expert gets picked depends on the token, not a fixed schedule) but it's *not* random. Run a real trace and you'll find some layers have highly repetitive expert selection (the same handful of experts keep getting picked turn after turn) while others are basically uniform noise across the full expert pool. The repetitive ones are the ones worth pinning to GPU. The noisy ones will thrash the GPU cache no matter where you put them, so don't waste VRAM on them.
 
+## How it works, precisely
+
+Two things this repo actually needs to get right, spelled out instead of hand-waved:
+
+**What "hot" means, exactly.** `locality_sorted.tsv` ranks each layer by an `avg_overlap` score: for that layer, look at the set of experts selected on one decode step and the set selected on the *next* decode step, count how many experts are in both sets, and average that count across the whole trace. Qwen3-30B-A3B picks 8 experts per layer per token, so the score ranges from 0 (completely different experts every step, pure noise) to 8 (the exact same 8 experts get reused every single step). A layer scoring 6.17 means, on average, 6 of the next step's 8 experts were *already* used the step before. That's the number that actually predicts whether caching a layer's experts pays off: high overlap means whatever you pin stays relevant step after step, low overlap means you're constantly evicting and refetching regardless of what you pinned.
+
+**Why pinning changes speed at all.** `llama.cpp` loads GGUF files via `mmap`, so weight tensors aren't unconditionally copied into RAM ahead of time. Untouched pages get faulted in from the OS page cache (or disk, on a true cold read) the moment they're actually read for a matmul. Every layer evaluation that touches a "cold" expert means paying that fault cost again, on every single decode step, for the whole session. `llama.cpp`'s `-ot` (override-tensor) flag forces specific tensors to live permanently on a named backend (`CUDA0`, in this repo's case) instead of being subject to that mmap/page-cache lifecycle. Pin a layer whose experts get reused constantly, and you pay the transfer cost roughly once instead of every step. Pin a layer whose experts barely repeat, and you've just spent VRAM on tensors that get swapped out just as often as if you'd left them alone; that's the entire reason placement has to be measured per layer instead of applied uniformly.
+
 ## What's actually in here
 
 - **`pick_hot_layers.sh`**: reads `layer_sizes.tsv` (how big each layer's expert tensors are) and `locality_sorted.tsv` (how "hot"/reusable each layer's expert selection is, ranked), greedily fills your free VRAM budget with the hottest layers that fit, and emits a ready-to-use `llama.cpp` `-ot` (override-tensor) string.
