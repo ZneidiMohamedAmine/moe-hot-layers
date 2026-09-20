@@ -36,6 +36,7 @@ Two things this repo actually needs to get right, spelled out instead of hand-wa
 - **`run_qwen.sh`**: launches `llama-cli` with hot layers auto-placed. One command, no manual `-ot` string editing.
 - **`start-chat.sh`**: same idea but starts `llama-server` and opens llama.cpp's own built-in web chat UI. No extra frontend needed.
 - **`layer_sizes.tsv` / `locality_sorted.tsv`**: the real trace data from this project's Qwen3-30B-A3B run, included as a working example so you can see the shape of real data and don't have to trace blind on your first try.
+- **`requantize_cold_layers.sh`**: uses the same locality ranking to shrink the model itself, not just its GPU placement. See "Bonus" below.
 
 The actual "which experts fired, how often, on which layer" tracing was done with a small instrumented harness hooked into `llama.cpp`'s `ggml_backend_sched_eval_callback` (analogous to a PyTorch `forward_hook`, just at the ggml graph level), logging every expert-selection tensor during real generations, then computing a locality score per layer (how much the top-K expert set overlaps turn to turn). That harness isn't published here in its raw form since it's tightly coupled to a specific llama.cpp build; `locality_sorted.tsv` is its output. If there's interest, the tracer itself is a good candidate for a follow-up repo.
 
@@ -51,6 +52,44 @@ All on the same box: GTX 1050 Ti, 4GB VRAM (~3.3GB free after desktop overhead),
 | **Hot-layer placement, live serving** | **7.2 tok/s** | Once genuinely warm (`llama-server`, real chat session) |
 
 The interesting part isn't the raw speedup, it's *why* it happens. Going from CPU-only to naive GPU offload only bought +33% generation speed despite handing real VRAM to real compute. If this were purely compute-bound, that number should have moved a lot more, since only ~3B parameters are active per token in the first place. It barely moved because *which* 2.7GB landed on the GPU was arbitrary, mostly cold layers that get evicted and refetched constantly. Once the *right* layers (measured, not guessed) are pinned, the same VRAM budget does meaningfully more work: **~30-40% faster than naive placement, using no additional hardware.**
+
+## Bonus: hotness-aware mixed-precision quantization
+
+Placement (this repo's main trick) decides *where* each layer's experts live. This second, independent trick uses the exact same locality data to decide *how precisely* each layer's experts get stored in the first place, and the results were the biggest single win found in this whole project.
+
+The idea: cold layers get touched so rarely that their quantization precision barely matters for output quality, but they still cost the same disk-read and decompress time as hot layers every time they *do* get touched. So: keep the top-N hottest layers (by the same `locality_sorted.tsv` ranking used for GPU placement) at the model's original quant, and requantize every other layer's expert tensors down to a much smaller quant type. `requantize_cold_layers.sh` does exactly this using `llama-quantize --tensor-type-file` (keeps the top 7 layers at Q4_K_M, drops the other 41 to Q2_K by default; both are configurable via `KEEP_HOT` and `COLD_QUANT` env vars).
+
+Measured on the same box, same hot-layer GPU placement, only the file itself changed:
+
+| | Original (uniform Q4_K_M) | Mixed (hot Q4_K_M, cold Q2_K) | Change |
+|---|---|---|---|
+| File size | 18.56 GB | 11.61 GB | **-37%** |
+| Model load time | 38s | 24s | -37% |
+| Average generation | 7.10 tok/s | **8.71 tok/s** | **+23%** |
+| Max generation | 9.89 tok/s | 10.20 tok/s | +3% |
+| Min generation (cold-start floor) | 2.20 tok/s | **4.89 tok/s** | **+122%** |
+
+The cold-start floor more than doubling is the real story here: a smaller file means less data to fault in from disk before the model can compute anything at all, and that's exactly the worst-case moment placement alone can't help with (a layer that was never going to be GPU-resident is still slow to read the first time no matter where it's placed). Spot-checking actual output on code, story, and explanation prompts showed no visible quality degradation from demoting the cold experts, consistent with the thesis that rarely-used experts can afford to be lower precision.
+
+```bash
+./requantize_cold_layers.sh /path/to/original-Q4_K_M.gguf /path/to/output-mixed.gguf
+# Then use the SAME -ot string from pick_hot_layers.sh with the new file --
+# tensor/layer names are unchanged, only cold-layer precision dropped.
+```
+
+Worth noting: `llama-quantize --allow-requantize` dequantizes and requantizes the *already-quantized* source file, which stacks some extra error on top of the original quantization. That's an acceptable tradeoff for cold layers here (rarely used, error barely shows up), but if you have access to the original fp16/bf16 weights, quantizing directly from those instead of double-quantizing would be strictly better quality for the same trick.
+
+### A path that didn't pan out: speculative decoding
+
+Worth documenting since it's a natural thing to try next and the honest answer is: not worth it, at least not here. Tested both a real tiny draft model (Qwen3-0.6B, forced CPU-only so it wouldn't compete for VRAM) and n-gram-based speculation (no extra model at all) against the same hot-layer placement, 3 prompts x 3 repetitions each:
+
+| Config | Average | Max | Min |
+|---|---|---|---|
+| Baseline (no speculative decoding) | 6.83 tok/s | 8.74 tok/s | 2.06 tok/s |
+| + real draft model (CPU-only) | 6.97 tok/s | 8.99 tok/s | 2.04 tok/s |
+| + n-gram speculation | 6.97 tok/s | 8.90 tok/s | 2.37 tok/s |
+
+Both gave only a ~2% average improvement, well within noise at this sample size, dwarfed by what the mixed-precision quantization trick above delivered for comparable effort. Not every promising-sounding idea pays off; this one didn't clear the bar here.
 
 ## Prior art (because credit matters and reinventing wheels badly is worse than not reinventing them)
 
